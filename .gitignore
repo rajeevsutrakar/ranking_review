@@ -1,0 +1,9 @@
+/.env
+/data/
+
+/review-ranking-agent/app/runtime.log
+/review-ranking-no-llm/app/runtime_no_llm.log
+/review-ranking-agent/app/ranked_results.log
+/review-ranking-no-llm/app/ranked_results_no_llm.log
+/ranked_results_no_llm/.env
+/venv/
