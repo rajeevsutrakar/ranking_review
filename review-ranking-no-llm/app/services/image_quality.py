@@ -36,12 +36,12 @@ def _normalize_blur(laplacian_var: float) -> float:
 def _normalize_brightness(gray: np.ndarray) -> float:
     """Brightness score: penalize very dark/very bright images."""
     mean_b = float(np.mean(gray)) / 255.0
-    # Ideal brightness range: 0.3-0.7 (not too dark, not too bright)
-    if 0.3 <= mean_b <= 0.7:
+    # Ideal range: 0.2-0.7. Lower bound is 0.2 (not 0.3) so that legitimate
+    # photos of dark-coloured products (black kurta, dark fabric) are not penalised.
+    if 0.2 <= mean_b <= 0.7:
         return 1.0
-    # Outside range: score decreases linearly
-    if mean_b < 0.3:
-        return max(0.0, mean_b / 0.3)  # 0 at black, 1.0 at 0.3
+    if mean_b < 0.2:
+        return max(0.0, mean_b / 0.2)  # 0 at black, 1.0 at 0.2
     else:  # mean_b > 0.7
         return max(0.0, (1.0 - mean_b) / 0.3)  # 1.0 at 0.7, 0 at 1.0
 

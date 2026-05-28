@@ -34,11 +34,11 @@ _DEFAULT_CACHE_PATH = Path(__file__).resolve().parent.parent / "clip_score_cache
 
 # Three-tier human prominence prompts — embedded once, reused for every image.
 # Tier 1 (full):    clear full-body shot → full CLIP_HUMAN_WEIGHT interpolation
-# Tier 2 (partial): mirror selfie / seated / partially visible → half interpolation
-# Tier 3 (none):    distant/tiny person or no person → raw CLIP score only
+# Tier 2 (partial): selfie / mirror shot / seated / upper-body visible → half interpolation
+# Tier 3 (none):    packaging / fabric / no person → raw CLIP score only
 _FULL_BODY_PROMPT = "a person wearing the complete outfit from head to toe clearly visible"
-_HUMAN_PROMPT     = "a person wearing or using the product"
-_NO_HUMAN_PROMPT  = "a product photo with no people"
+_HUMAN_PROMPT     = "a selfie or photo of a person wearing or showing the product"
+_NO_HUMAN_PROMPT  = "a product photo, packaging, or fabric with no person"
 _full_body_emb: np.ndarray | None = None
 _human_emb:     np.ndarray | None = None
 _no_human_emb:  np.ndarray | None = None
@@ -191,7 +191,7 @@ def human_prominence_score(image_emb: np.ndarray) -> float:
 
     if full_sim > no_human_sim + 0.02:
         return 1.0
-    if partial_sim > no_human_sim + 0.01:
+    if partial_sim > no_human_sim:
         return 0.5
     return 0.0
 
