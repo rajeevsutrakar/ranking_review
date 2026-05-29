@@ -7,18 +7,23 @@ A fully deterministic product review ranking pipeline that scores and sorts cust
 ## How It Works
 
 ```
-PostgreSQL DB
+PostgreSQL DB  (query: score IS NULL — only new, unscored reviews)
      │
      ▼
 Fetch reviews (grouped by product)
      │
      ▼
-Build ImageSimilarityMap
+Build ImageSimilarityMap  (for new review images only)
   ├── OpenCV: blur + brightness + resolution score per image URL
   ├── CLIP: cosine similarity of review image vs product reference
-  │         (image-to-image if media_url exists, text-to-image fallback via title)
-  ├── Human prominence detection (full-body / selfie / none)
-  └── Blended score = (opencv_score + clip_score) / 2
+  │    ├── image-to-image if media_url exists (most accurate)
+  │    └── text-to-image fallback via title × 0.75 scale
+  ├── Four-tier image classification (zero-shot CLIP, no extra model)
+  │    ├── full_worn  → boost 1.0  (person wearing product, full body)
+  │    ├── partial    → boost 0.6  (selfie, mirror, lifestyle)
+  │    ├── display    → boost 0.15 (flat-lay, hanger, no person)
+  │    └── packaging  → penalty   (delivery bag, shipping box)
+  └── blended = 0.65 × adjusted_clip + 0.35 × opencv_score
      │
      ▼
 Heuristic scoring per review
@@ -64,26 +69,40 @@ raw_clip = cosine_similarity(review_image_embedding, product_reference_embedding
 2. Title only → `"a person wearing or using {title}"` text prompt (fallback, 0.75× weight in blend)
 3. Neither → CLIP scoring skipped, opencv score only
 
-**Human prominence bonus** (interpolation, not flat addition):
+**Four-tier image classification** (zero-shot CLIP, 4 text prompts, no extra model):
+
+| Tier | boost_factor | Condition | Example |
+|---|---|---|---|
+| Full-body worn | `1.0` | full-worn sim dominates display sim by >0.02 | Standing full-length outfit photo |
+| Partial / selfie | `0.6` | partial-worn sim > display sim | Mirror selfie, lifestyle shot, upper-body |
+| Product displayed | `0.15` | display sim wins, no packaging | Flat-lay, hanger, mannequin |
+| Packaging | penalty | packaging sim ≥ best positive | Courier bag, delivery mailer, brand bag |
+
+**Adjusted CLIP score:**
 
 ```
-prominence = 1.0  →  full-body shot clearly visible
-prominence = 0.5  →  selfie / mirror shot / upper-body visible
-prominence = 0.0  →  packaging / fabric / no person
+# Human-wearing tiers:
+adjusted_clip = raw_clip + boost_factor × CLIP_HUMAN_WEIGHT × (1 − raw_clip)
 
-clip_score = raw_clip + prominence × CLIP_HUMAN_WEIGHT × (1 − raw_clip)
+# Packaging tier:
+adjusted_clip = raw_clip × PACKAGING_SCORE_PENALTY
 ```
 
-With default `CLIP_HUMAN_WEIGHT = 0.70`:
-- Full-body, raw_clip=0.30 → clip_score = **0.79**
-- Selfie, raw_clip=0.22 → clip_score = **0.49**
-- Packaging, raw_clip=0.15 → clip_score = **0.15** (no bonus)
+With defaults `CLIP_HUMAN_WEIGHT=0.70`, `PACKAGING_SCORE_PENALTY=0.20`:
+- Full-body worn, raw_clip=0.30 → adjusted = **0.79**
+- Selfie/mirror, raw_clip=0.28 → adjusted = **0.58**
+- Flat-lay (product shown), raw_clip=0.45 → adjusted = **0.51** (small boost only)
+- Packaging bag, raw_clip=0.20 → adjusted = **0.04** (penalised)
 
 **Blended image score** stored in `product_review_image_similarity`:
 
 ```
-blended = (opencv_score + clip_score) / 2
+blended = CLIP_WEIGHT_IN_BLEND × adjusted_clip + OPENCV_WEIGHT_IN_BLEND × opencv_score
+        = 0.65 × adjusted_clip + 0.35 × opencv_score
 ```
+
+CLIP (product relevance + usage context) is the primary signal at 65%.
+OpenCV quality (blur, brightness, resolution) is the modifier at 35%.
 
 ### Final Review Score
 
@@ -146,10 +165,19 @@ DB_PASSWORD=your_password
 # HuggingFace (optional — suppresses auth warning)
 HF_ACCESS_TOKEN=hf_...
 
-# Scoring weights (all optional — defaults shown)
-NO_LLM_TEXT_BLEND_WEIGHT=0.40
+# Final review ranking: image score vs text signal
 NO_LLM_IMAGE_BLEND_WEIGHT=0.60
+NO_LLM_TEXT_BLEND_WEIGHT=0.40
+
+# Image similarity blend: CLIP relevance vs OpenCV quality
+CLIP_WEIGHT_IN_BLEND=0.65
+OPENCV_WEIGHT_IN_BLEND=0.35
+
+# CLIP scoring
 CLIP_HUMAN_WEIGHT=0.70
+PACKAGING_SCORE_PENALTY=0.20
+
+# Other
 RECENCY_HALF_LIFE_DAYS=30
 IMAGE_QUALITY_MAX_IMAGES=15
 IMAGE_QUALITY_REQUEST_TIMEOUT_S=8
@@ -182,8 +210,7 @@ rank-reviews --limit 100
 | File / Table | Content |
 |---|---|
 | `app/ranked_results_no_llm.log` | JSON append per run — ranked review IDs + scores per product |
-| `app/runtime_no_llm.log` | Timestamped run log (INFO / ERROR) |
-| `app/clip_score_cache.json` | Running-average CLIP scores per (product, image URL) — persists across runs |
+| `app/runtime_no_llm.log` | Timestamped run log — includes per-image `[clip]` tier lines for debugging |
 | `shopify_product_review.score` | OpenCV image quality score written back per review |
 | `product_review_image_similarity.products` | JSONB array `[[score, url], ...]` sorted by score desc per product |
 
@@ -232,17 +259,15 @@ CREATE TABLE product_review_image_similarity (
 app/
 ├── main.py                         Entry point — CLI, orchestration
 ├── config.py                       Env vars, weights, constants
-├── clip_score_cache.json           Persisted CLIP running averages (gitignored)
 │
 ├── models/
 │   ├── review.py                   Review dataclass + DB row parser
-│   ├── image_similarity.py         ImageSimilarityMap: {product_id: {url: score}}
-│   └── clip_score_cache.py         Running-average cache (load/save JSON)
+│   └── image_similarity.py         ImageSimilarityMap: {product_id: {url: score}}
 │
 └── services/
     ├── db_client.py                All PostgreSQL queries (fetch + write)
     ├── clip_client.py              CLIP model wrapper — embed, cosine sim,
-    │                               human prominence scoring
+    │                               four-tier image classification
     ├── image_quality.py            OpenCV blur/brightness/resolution scorer
     ├── image_similarity_loader.py  Builds ImageSimilarityMap (opencv + CLIP blend)
     ├── heuristic_scoring.py        Text signal, recency decay, final score + sort
@@ -253,31 +278,54 @@ app/
 
 ## Configuration Reference
 
+**Final review ranking**
+
 | Variable | Default | Description |
 |---|---|---|
-| `NO_LLM_IMAGE_BLEND_WEIGHT` | `0.60` | Weight of image score in final blend |
-| `NO_LLM_TEXT_BLEND_WEIGHT` | `0.40` | Weight of text signal in final blend |
-| `CLIP_HUMAN_WEIGHT` | `0.70` | How aggressively human presence boosts CLIP score (0=off, 1=always max) |
+| `NO_LLM_IMAGE_BLEND_WEIGHT` | `0.60` | Weight of image blended score in final review score |
+| `NO_LLM_TEXT_BLEND_WEIGHT` | `0.40` | Weight of text signal (length + rating + recency) in final review score |
 | `RECENCY_HALF_LIFE_DAYS` | `30` | Days for recency score to halve |
+
+**Image similarity blend**
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLIP_WEIGHT_IN_BLEND` | `0.65` | CLIP product-relevance share in the blended image score |
+| `OPENCV_WEIGHT_IN_BLEND` | `0.35` | OpenCV quality share in the blended image score |
+
+**CLIP scoring**
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLIP_HUMAN_WEIGHT` | `0.70` | Strength of the wearing-usage boost (0=off, 1=always max) |
+| `PACKAGING_SCORE_PENALTY` | `0.20` | Multiplier applied to CLIP score for packaging/delivery images |
+
+**Image fetch**
+
+| Variable | Default | Description |
+|---|---|---|
 | `IMAGE_QUALITY_MAX_IMAGES` | `15` | Max images scored per review |
 | `IMAGE_QUALITY_REQUEST_TIMEOUT_S` | `8` | HTTP timeout for image fetches |
 
 ---
 
-## CLIP Human Prominence Tiers
+## CLIP Image Classification Tiers
 
-The pipeline uses zero-shot CLIP classification (3 text prompts, no extra model) to detect how prominently a person is shown in each review image:
+The pipeline uses zero-shot CLIP classification (4 text prompts, no extra model) to assign each review image a tier that drives its adjusted CLIP score:
 
-| Tier | Prominence | Condition | Example |
+| Tier | boost_factor | Adjusted score | Example |
 |---|---|---|---|
-| Full body | `1.0` | `full_body_sim > no_human_sim + 0.02` | Standing full-length outfit shot |
-| Selfie / partial | `0.5` | `partial_sim > no_human_sim` | Mirror selfie, seated shot, collar selfie |
-| None | `0.0` | Neither condition met | Packaging, fabric close-up, no person |
+| Full-body worn | `1.0` | `raw + 1.0 × 0.70 × (1−raw)` | Standing full-length outfit photo |
+| Partial / selfie | `0.6` | `raw + 0.6 × 0.70 × (1−raw)` | Mirror selfie, lifestyle shot, upper-body |
+| Product displayed | `0.15` | `raw + 0.15 × 0.70 × (1−raw)` | Flat-lay, hanger, mannequin |
+| Packaging | penalty | `raw × 0.20` | Courier bag, delivery mailer, brand bag |
+
+Mirror selfies and casual worn photos are not penalised — image quality (OpenCV) differentiates them from studio shots at the same tier. Packaging images are penalised regardless of raw CLIP similarity, since brand illustrations on mailer bags can otherwise achieve deceptively high product similarity scores.
 
 ---
 
 ## Known Limitations
 
 - CLIP runs on CPU by default — scoring 100 images takes ~2–5 minutes depending on hardware.
-- The CLIP cache (`clip_score_cache.json`) stores running averages. If scoring logic changes significantly, delete the cache file before re-running to get clean scores.
 - Noise/corrupted images (Laplacian variance > 1200) are automatically scored 0 on the blur component.
+- Each review is scored exactly once (filtered by `score IS NULL`). Re-scoring requires resetting `shopify_product_review.score` to NULL for the affected reviews.

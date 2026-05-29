@@ -1,25 +1,36 @@
 """
 CLIP similarity client — openai/clip-vit-base-patch32.
 
-pipeline_shopify_product has exactly ONE image per product.
-Reference building:
-  1. Try media_url → embed as image (image-to-image).
-  2. If no media_url → embed title as "a product photo of <title>" (text-to-image).
-  3. If neither → return None.
+Scoring pipeline per review image
+──────────────────────────────────
+1. Embed review image (vision encoder).
+2. Compute raw product similarity: cosine(review_emb, product_reference_emb).
+3. Classify image into one of four tiers via zero-shot CLIP text prompts:
+     full_worn  → person clearly wearing the complete product (boost 1.0)
+     partial    → selfie, mirror shot, upper-body, lifestyle photo  (boost 0.6)
+     display    → flat-lay, hanger, mannequin (boost 0.15)
+     packaging  → courier bag, delivery box → penalty
+4. Apply adjustment:
+     packaging  → score × PACKAGING_SCORE_PENALTY
+     otherwise  → score + boost_factor × CLIP_HUMAN_WEIGHT × (1 − score)
 
-All embeddings are L2-normalised → cosine similarity = np.dot(a, b).
+No caching — the main pipeline filters score IS NULL so each review image
+is processed exactly once. No running-average state to go stale.
+
+Product reference priority (build_reference_embedding):
+  1. media_url  → image-to-image (most accurate)
+  2. title only → "a person wearing or using <title>" (text-to-image, 0.75× scaled)
+  3. neither    → CLIP skipped, opencv score only
 """
 from __future__ import annotations
 
 import io
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import requests
 
 import app.config  # ensures HF_TOKEN is set from .env before any HF Hub call
-from app.models.clip_score_cache import CLIPScoreCache
 
 if TYPE_CHECKING:
     from PIL import Image as PILImage
@@ -30,18 +41,28 @@ _REQUEST_TIMEOUT_S = 10
 _clip_model = None
 _clip_processor = None
 
-_DEFAULT_CACHE_PATH = Path(__file__).resolve().parent.parent / "clip_score_cache.json"
+# ── Four-tier image classification prompts ────────────────────────────────────
+#
+# Tier 1 — full_worn (boost 1.0):
+#   Real photo, person wearing the complete product, full body visible.
+# Tier 2 — partial (boost 0.6):
+#   Real photo, person wearing/using product — selfie, mirror, upper-body, lifestyle.
+# Tier 3 — display (boost 0.15):
+#   The product itself clearly shown (flat-lay, hanger) but no person.
+# Tier 4 — packaging (penalty):
+#   Specifically physical delivery packaging (poly mailer, cardboard box).
+#   Prompt avoids broad terms like "printed illustration" which can match
+#   decorative backgrounds in genuine worn-product photos.
+#
+_WORN_FULL_PROMPT    = "a real photograph of a person wearing a complete outfit, full body visible from head to toe"
+_WORN_PARTIAL_PROMPT = "a real photo of a person wearing clothing — selfie, mirror shot, upper body, or casual lifestyle photo"
+_PRODUCT_DISPLAY_PROMPT = "a garment or clothing item displayed as a product photo — flat lay, on a hanger, or on a mannequin"
+_PACKAGING_PROMPT    = "a flat plastic poly mailer bag or cardboard shipping box used for product delivery and packaging"
 
-# Three-tier human prominence prompts — embedded once, reused for every image.
-# Tier 1 (full):    clear full-body shot → full CLIP_HUMAN_WEIGHT interpolation
-# Tier 2 (partial): selfie / mirror shot / seated / upper-body visible → half interpolation
-# Tier 3 (none):    packaging / fabric / no person → raw CLIP score only
-_FULL_BODY_PROMPT = "a person wearing the complete outfit from head to toe clearly visible"
-_HUMAN_PROMPT     = "a selfie or photo of a person wearing or showing the product"
-_NO_HUMAN_PROMPT  = "a product photo, packaging, or fabric with no person"
-_full_body_emb: np.ndarray | None = None
-_human_emb:     np.ndarray | None = None
-_no_human_emb:  np.ndarray | None = None
+_worn_full_emb:    np.ndarray | None = None
+_worn_partial_emb: np.ndarray | None = None
+_product_disp_emb: np.ndarray | None = None
+_packaging_emb:    np.ndarray | None = None
 
 
 # ── model ─────────────────────────────────────────────────────────────────────
@@ -102,7 +123,6 @@ def embed_image_from_url(url: str) -> np.ndarray | None:
         vis_out = model.vision_model(
             pixel_values=inputs["pixel_values"], return_dict=True
         )
-        # pooler_output = CLS token, shape (1, 768)
         features = model.visual_projection(vis_out.pooler_output)  # (1, 512)
     return _l2_normalize(features[0].cpu().numpy().astype(np.float32))
 
@@ -111,7 +131,7 @@ def embed_text(prompt: str) -> np.ndarray:
     """
     L2-normalised CLIP text embedding [512].
 
-    Uses text_model → text_projection directly for the same version-safety reason.
+    Uses text_model → text_projection directly for version-safety.
     """
     import torch
     model, processor = _get_clip()
@@ -122,7 +142,6 @@ def embed_text(prompt: str) -> np.ndarray:
             attention_mask=inputs["attention_mask"],
             return_dict=True,
         )
-        # pooler_output = EOS token, shape (1, 512)
         features = model.text_projection(txt_out.pooler_output)  # (1, 512)
     return _l2_normalize(features[0].cpu().numpy().astype(np.float32))
 
@@ -139,8 +158,6 @@ def build_reference_embedding(
 ) -> tuple[np.ndarray | None, str]:
     """
     Build the reference embedding for one product.
-    pipeline_shopify_product has exactly one row per product.
-
     Returns (embedding, mode) where mode = "image" | "text" | "none".
     """
     if media_url:
@@ -150,87 +167,111 @@ def build_reference_embedding(
 
     if title:
         # Action-oriented prompt: better CLIP discrimination for review images
-        # (people wearing/using the product) than a plain "product photo" description.
+        # (people wearing/using the product) than a plain product description.
         return embed_text(f"a person wearing or using {title}"), "text"
 
     return None, "none"
 
 
-# ── human presence detection ─────────────────────────────────────────────────
+# ── four-tier image classification ───────────────────────────────────────────
 
-def _get_human_detection_embeddings() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _get_classification_embeddings() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Return (full_body_emb, human_emb, no_human_emb) — computed once, cached in module globals.
-    Cost: 3 CLIP text forward passes on first call, then zero.
+    Return (worn_full_emb, worn_partial_emb, product_disp_emb, packaging_emb).
+    Computed once on first call, cached in module globals.
     """
-    global _full_body_emb, _human_emb, _no_human_emb
-    if _human_emb is None:
-        _full_body_emb = embed_text(_FULL_BODY_PROMPT)
-        _human_emb     = embed_text(_HUMAN_PROMPT)
-        _no_human_emb  = embed_text(_NO_HUMAN_PROMPT)
-    return _full_body_emb, _human_emb, _no_human_emb
+    global _worn_full_emb, _worn_partial_emb, _product_disp_emb, _packaging_emb
+    if _worn_full_emb is None:
+        _worn_full_emb    = embed_text(_WORN_FULL_PROMPT)
+        _worn_partial_emb = embed_text(_WORN_PARTIAL_PROMPT)
+        _product_disp_emb = embed_text(_PRODUCT_DISPLAY_PROMPT)
+        _packaging_emb    = embed_text(_PACKAGING_PROMPT)
+    return _worn_full_emb, _worn_partial_emb, _product_disp_emb, _packaging_emb
 
 
-def human_prominence_score(image_emb: np.ndarray) -> float:
+def classify_image_type(image_emb: np.ndarray) -> tuple[float, str]:
     """
-    Three-tier CLIP classification of how prominently a person+outfit appears.
+    Classify a review image into one of four tiers using zero-shot CLIP.
 
-    Returns:
-        1.0 — full body clearly visible (clear outfit shot, person dominant in frame)
-        0.5 — partial visibility (mirror selfie, seated, person in background)
-        0.0 — no human or person too distant/tiny to show the product
+    Returns (boost_factor, tier_name):
+        (1.0,  "full_worn")  — full-body worn photo
+        (0.6,  "partial")    — selfie / mirror / lifestyle
+        (0.15, "display")    — product displayed, no person
+        (0.0,  "packaging")  — delivery bag / box
 
-    Thresholds (0.02 / 0.01) are margins over the no-human baseline required to
-    qualify for each tier. CLIP cosine differences for these prompts typically
-    fall in the 0.01–0.05 range, so these are deliberately conservative.
+    Packaging requires pkg_sim > best_positive + 0.03 to prevent false positives
+    from decorative walls, patterned backgrounds, or busy indoor scenes.
     """
-    full_body_emb, human_emb, no_human_emb = _get_human_detection_embeddings()
-    full_sim     = cosine_similarity(image_emb, full_body_emb)
-    partial_sim  = cosine_similarity(image_emb, human_emb)
-    no_human_sim = cosine_similarity(image_emb, no_human_emb)
+    full_emb, partial_emb, disp_emb, pkg_emb = _get_classification_embeddings()
 
-    if full_sim > no_human_sim + 0.02:
-        return 1.0
-    if partial_sim > no_human_sim:
-        return 0.5
-    return 0.0
+    full_sim    = cosine_similarity(image_emb, full_emb)
+    partial_sim = cosine_similarity(image_emb, partial_emb)
+    disp_sim    = cosine_similarity(image_emb, disp_emb)
+    pkg_sim     = cosine_similarity(image_emb, pkg_emb)
+
+    best_positive = max(full_sim, partial_sim, disp_sim)
+
+    if pkg_sim > best_positive + 0.03:
+        return 0.0, "packaging"
+
+    if full_sim > disp_sim + 0.01 and full_sim > pkg_sim + 0.01:
+        return 1.0, "full_worn"
+
+    if partial_sim > disp_sim and partial_sim > pkg_sim:
+        return 0.6, "partial"
+
+    return 0.15, "display"
 
 
-# ── score review images + update cache ────────────────────────────────────────
+# ── score review images ────────────────────────────────────────────────────────
 
 def compute_clip_scores(
     product_id: int,
     review_image_urls: list[str],
     reference_embedding: np.ndarray,
-    cache: CLIPScoreCache,
 ) -> dict[str, float]:
     """
-    Compute CLIP cosine similarity for each review image vs. the reference.
+    Compute adjusted CLIP score for each review image vs. the product reference.
 
-    Human prominence interpolation:
-        score = raw_clip + prominence × CLIP_HUMAN_WEIGHT × (1 − raw_clip)
+    No caching — each review image is processed exactly once because the pipeline
+    filters score IS NULL in the DB query. Running averages would only accumulate
+    stale values when the scoring formula changes.
 
-    This pulls the score toward 1.0 proportionally — full-body shots of someone
-    clearly wearing the product rank highest, while product similarity still
-    differentiates images at the same prominence tier. Never exceeds 1.0.
+    Scoring per image:
+      1. raw_clip  = cosine_similarity(review_emb, reference_emb)
+      2. tier      = classify_image_type(review_emb)
+      3a. packaging  → adjusted = raw_clip × PACKAGING_SCORE_PENALTY
+      3b. otherwise  → adjusted = raw_clip + boost × CLIP_HUMAN_WEIGHT × (1 − raw_clip)
 
-    Updates running averages in cache (does NOT call cache.save — caller saves).
-    Returns {image_url: updated_avg_clip_score}.
+    A log line is written per image so tier assignments can be inspected
+    in runtime_no_llm.log when debugging unexpected scores.
+
+    Returns {image_url: adjusted_clip_score}.
     """
-    from app.config import CLIP_HUMAN_WEIGHT
+    from app.config import CLIP_HUMAN_WEIGHT, PACKAGING_SCORE_PENALTY
+    from app.services.run_logger import log_info
 
-    raw: dict[str, float] = {}
+    scores: dict[str, float] = {}
     for url in review_image_urls:
         emb = embed_image_from_url(url)
-        if emb is not None:
-            score = cosine_similarity(emb, reference_embedding)
-            if CLIP_HUMAN_WEIGHT > 0:
-                prominence = human_prominence_score(emb)
-                if prominence > 0:
-                    score = score + prominence * CLIP_HUMAN_WEIGHT * (1.0 - score)
-            raw[url] = score
-    return cache.update_batch(product_id, raw)
+        if emb is None:
+            continue
 
+        raw_clip = cosine_similarity(emb, reference_embedding)
+        boost_factor, tier = classify_image_type(emb)
 
-def get_or_load_cache(cache_path: Path | None = None) -> CLIPScoreCache:
-    return CLIPScoreCache(cache_path or _DEFAULT_CACHE_PATH)
+        if tier == "packaging":
+            score = raw_clip * PACKAGING_SCORE_PENALTY
+        elif boost_factor > 0:
+            score = raw_clip + boost_factor * CLIP_HUMAN_WEIGHT * (1.0 - raw_clip)
+        else:
+            score = raw_clip
+
+        fname = url.rsplit("/", 1)[-1].split("?")[0]
+        log_info(
+            f"[clip] pid={product_id} tier={tier:10s} "
+            f"raw={raw_clip:.3f} adjusted={score:.3f}  {fname}"
+        )
+        scores[url] = score
+
+    return scores

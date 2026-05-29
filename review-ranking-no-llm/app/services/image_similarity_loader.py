@@ -2,21 +2,25 @@
 Load review images into ImageSimilarityMap with blended scores.
 
 Score stored per image:
-    products[product_id][image_url] = (opencv_score + clip_score) / 2
+    blended = CLIP_WEIGHT_IN_BLEND × adjusted_clip + OPENCV_WEIGHT_IN_BLEND × opencv_score
 
-Reference image for CLIP comes from pipeline_shopify_product.media_url (one row
-per product). Falls back to title text-prompt when media_url is missing.
-CLIP scores are cached in clip_score_cache.json so re-runs cost nothing.
+adjusted_clip already incorporates:
+  - product reference similarity (primary)
+  - human-wearing bonus (full-body / selfie / lifestyle tiers)
+  - packaging penalty (courier bags, delivery envelopes)
+
+No caching — the query filters score IS NULL, so each review image is
+processed exactly once. There is nothing to cache.
 """
 from __future__ import annotations
 
 from typing import Dict, List
 
+from app.config import CLIP_WEIGHT_IN_BLEND, OPENCV_WEIGHT_IN_BLEND
 from app.models.image_similarity import ImageSimilarityMap
 from app.services.clip_client import (
     build_reference_embedding,
     compute_clip_scores,
-    get_or_load_cache,
 )
 from app.services.db_client import (
     _build_conn,
@@ -36,8 +40,11 @@ def _fetch_review_images(
     product_ids: List[int] | None,
 ) -> Dict[int, Dict[str, float]]:
     """
-    Query shopify_product_review and return:
+    Query unscored review images and return:
         {product_id: {image_url: opencv_score}}
+
+    Filters score IS NULL to match the main pipeline query — only new reviews
+    are processed, so each image is CLIP-scored exactly once.
     """
     _, RealDictCursor = _get_psycopg2()
 
@@ -55,6 +62,7 @@ def _fetch_review_images(
           AND jsonb_array_length(images) > 0
           AND status = TRUE
           AND show_at_frontend = TRUE
+          AND score IS NULL
           {product_filter}
         ORDER BY product_id
     """
@@ -76,20 +84,19 @@ def _fetch_review_images(
 
 def load_image_similarity_map(product_ids: List[int] | None = None) -> ImageSimilarityMap:
     """
-    Build ImageSimilarityMap where each score = (opencv_score + clip_score) / 2.
+    Build ImageSimilarityMap for unscored review images only.
 
     Steps
     -----
-    1. Query all review images → opencv_score per (product, url).
+    1. Query new (score IS NULL) review images → opencv_score per (product, url).
     2. Fetch one reference row per product from pipeline_shopify_product.
-    3. Build CLIP reference embedding (image URL → text fallback).
-    4. For each review image compute clip_score, update running-avg cache.
-    5. Blend: combined = (opencv_score + clip_score) / 2.
-    6. Store in ImageSimilarityMap, sorted by URL within each product.
-    7. Save CLIP cache to disk.
+    3. Build CLIP reference embedding (product image → title text fallback).
+    4. For each review image compute adjusted_clip (product similarity + tier
+       boost or packaging penalty).
+    5. Blend: blended = CLIP_WEIGHT × adjusted_clip + OPENCV_WEIGHT × opencv_score
+    6. Store in ImageSimilarityMap.
     """
     similarity_map = ImageSimilarityMap()
-    cache = get_or_load_cache()
 
     # Step 1 — opencv scores per review image
     opencv_map = _fetch_review_images(product_ids)
@@ -118,10 +125,8 @@ def load_image_similarity_map(product_ids: List[int] | None = None) -> ImageSimi
         review_urls = list(url_opencv.keys())
 
         if ref_emb is not None:
-            # clip_scores = {url: avg_clip_score} (running avg updated in cache)
-            clip_scores = compute_clip_scores(pid, review_urls, ref_emb, cache)
-            # Text-reference scores are less reliable — scale down before blending
-            # so OpenCV quality has proportionally more influence on the final rank.
+            clip_scores = compute_clip_scores(pid, review_urls, ref_emb)
+            # Text-reference scores are less reliable — scale down before blending.
             if mode == "text":
                 clip_scores = {url: s * _TEXT_CLIP_SCALE for url, s in clip_scores.items()}
         else:
@@ -133,13 +138,11 @@ def load_image_similarity_map(product_ids: List[int] | None = None) -> ImageSimi
             opencv_score = url_opencv[url]
             clip_score = clip_scores.get(url)
             if clip_score is not None:
-                combined = (opencv_score + clip_score) / 2.0
+                blended = CLIP_WEIGHT_IN_BLEND * clip_score + OPENCV_WEIGHT_IN_BLEND * opencv_score
             else:
-                combined = opencv_score  # CLIP unavailable → opencv only
-            similarity_map.add_image(pid, url, score=combined)
-
-    # Step 7 — persist CLIP cache
-    cache.save()
+                # CLIP unavailable — fall back to opencv quality only
+                blended = opencv_score
+            similarity_map.add_image(pid, url, score=blended)
 
     return similarity_map
 

@@ -6,4 +6,3 @@ __pycache__/
 *.egg-info/
 app/ranked_results_no_llm.log
 app/runtime_no_llm.log
-app/clip_score_cache.json

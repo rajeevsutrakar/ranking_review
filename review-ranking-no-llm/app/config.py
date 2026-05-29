@@ -32,7 +32,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
 DB_HOST = os.getenv("DB_HOST")
 
-# Blend deterministic text-side signal vs OpenCV image quality when both exist.
+# Blend deterministic text-side signal vs image score in the final review ranking.
 TEXT_BLEND_WEIGHT = float(os.getenv("NO_LLM_TEXT_BLEND_WEIGHT", "0.40"))
 IMAGE_BLEND_WEIGHT = float(os.getenv("NO_LLM_IMAGE_BLEND_WEIGHT", "0.60"))
 
@@ -48,8 +48,22 @@ IMAGE_QUALITY_REQUEST_TIMEOUT_S = float(os.getenv("IMAGE_QUALITY_REQUEST_TIMEOUT
 
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "30"))
 
-# How aggressively to reward human presence in review images (0.0–1.0).
-# Uses interpolation: score = raw_clip + prominence × weight × (1 − raw_clip)
-# 0.0 → human presence ignored; 1.0 → full-body shot always scores 1.0.
-# 0.70 balances product-similarity signal with rewarding real-usage photos.
+# ── CLIP scoring ──────────────────────────────────────────────────────────────
+
+# How aggressively wearing/usage context boosts the adjusted CLIP score.
+# Interpolation: adjusted = raw_clip + boost_factor × weight × (1 − raw_clip)
+# 0.0 → human presence ignored; 0.70 is a strong but bounded boost.
 CLIP_HUMAN_WEIGHT = float(os.getenv("CLIP_HUMAN_WEIGHT", "0.70"))
+
+# Score multiplier for images classified as packaging/delivery materials.
+# Packaging (courier bags, boxes) may share brand CLIP semantics with the product
+# but gives customers zero purchase signal → penalise heavily.
+# 0.20 → packaging CLIP score reduced to 20% of raw value before blending.
+PACKAGING_SCORE_PENALTY = float(os.getenv("PACKAGING_SCORE_PENALTY", "0.20"))
+
+# ── Image similarity blend ────────────────────────────────────────────────────
+
+# CLIP product-similarity is the primary signal; OpenCV quality is a modifier.
+# 65 / 35 ensures product relevance dominates while still rewarding clear photos.
+CLIP_WEIGHT_IN_BLEND   = float(os.getenv("CLIP_WEIGHT_IN_BLEND",   "0.65"))
+OPENCV_WEIGHT_IN_BLEND = float(os.getenv("OPENCV_WEIGHT_IN_BLEND", "0.35"))
