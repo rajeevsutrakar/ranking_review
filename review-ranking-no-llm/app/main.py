@@ -12,9 +12,11 @@ Flow (single product):
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from app.models.review import Review
@@ -80,6 +82,53 @@ def _serialize(ranked_by_product: dict, similarity_map) -> dict:
     }
 
 
+_OPENCV_CSV_HEADERS = [
+    "product_id", "review_id", "rating", "has_image_url",
+    "blur_score", "brightness_score", "resolution_score", "opencv_image_score",
+]
+
+_IMAGE_SIMILARITY_CSV_HEADERS = [
+    "product_id", "image_url", "clip_opencv_blended_score",
+]
+
+
+def _write_opencv_csv(ranked_by_product: dict) -> None:
+    path = Path(__file__).resolve().parent / "opencv_scores.csv"
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_OPENCV_CSV_HEADERS)
+        writer.writeheader()
+        for product_id, reviews in ranked_by_product.items():
+            for r in reviews:
+                writer.writerow({
+                    "product_id": product_id,
+                    "review_id": r.review_id,
+                    "rating": int(r.rating or 0),
+                    "has_image_url": review_has_image_url(r),
+                    "blur_score": round(float(r.blur_score), 6),
+                    "brightness_score": round(float(r.brightness_score), 6),
+                    "resolution_score": round(float(r.resolution_score), 6),
+                    "opencv_image_score": round(float(r.image_quality_score), 6),
+                })
+    log_info(f"OpenCV scores written to {path}")
+
+
+def _write_image_similarity_csv(similarity_map) -> None:
+    path = Path(__file__).resolve().parent / "image_similarity_scores.csv"
+    sim_dict = similarity_map.to_dict()
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_IMAGE_SIMILARITY_CSV_HEADERS)
+        writer.writeheader()
+        for product_id, url_scores in sim_dict.items():
+            sorted_urls = sorted(url_scores.items(), key=lambda x: x[1], reverse=True)
+            for image_url, score in sorted_urls:
+                writer.writerow({
+                    "product_id": product_id,
+                    "image_url": image_url,
+                    "clip_opencv_blended_score": round(float(score), 6),
+                })
+    log_info(f"Image similarity scores written to {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rank-reviews",
@@ -124,7 +173,10 @@ def main() -> None:
     try:
         similarity_map = load_image_similarity_map(product_ids=list(grouped.keys()))
     except Exception as exc:
-        log_error(f"ImageSimilarityMap load failed: {exc}. Continuing without CLIP scores.")
+        log_error(
+            f"ImageSimilarityMap load failed: {exc}. Continuing without CLIP scores.\n"
+            f"Traceback:\n{traceback.format_exc()}"
+        )
         from app.models.image_similarity import ImageSimilarityMap
         similarity_map = ImageSimilarityMap()
 
@@ -169,6 +221,10 @@ def main() -> None:
         fh.write("\n\n")
 
     log_info(f"Result appended to {output_path}")
+
+    _write_opencv_csv(ranked_by_product)
+    _write_image_similarity_csv(similarity_map)
+
     log_info(f"Run finished in {time.perf_counter() - t0:.2f}s")
 
 

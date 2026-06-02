@@ -14,6 +14,7 @@ processed exactly once. There is nothing to cache.
 """
 from __future__ import annotations
 
+import traceback
 from typing import Dict, List
 
 from app.config import CLIP_WEIGHT_IN_BLEND, OPENCV_WEIGHT_IN_BLEND
@@ -21,6 +22,7 @@ from app.models.image_similarity import ImageSimilarityMap
 from app.services.clip_client import (
     build_reference_embedding,
     compute_clip_scores,
+    compute_clip_scores_text_ref,
 )
 from app.services.db_client import (
     _build_conn,
@@ -29,11 +31,6 @@ from app.services.db_client import (
 )
 from app.services.image_quality import compute_image_quality_scores_per_url
 from app.services.run_logger import log_info
-
-# Text-to-image CLIP is inherently less discriminative than image-to-image.
-# Scale down text-reference CLIP scores before blending so noisy text scores
-# don't dominate the combined ranking.
-_TEXT_CLIP_SCALE = 0.75
 
 
 def _fetch_review_images(
@@ -109,40 +106,49 @@ def load_image_similarity_map(product_ids: List[int] | None = None) -> ImageSimi
 
     # Step 3–5 — per product: build reference, score, blend
     for pid, url_opencv in opencv_map.items():
-        row = ref_rows_by_pid.get(pid, {})
-        media_url = row.get("media_url")
-        title = row.get("title")
+        try:
+            row = ref_rows_by_pid.get(pid, {})
+            media_url = row.get("media_url")
+            title = row.get("title")
 
-        ref_emb, mode = build_reference_embedding(media_url, title)
+            ref_emb, mode = build_reference_embedding(media_url, title)
 
-        if mode != "image":
-            log_info(
-                f"[similarity] product_id={pid} reference mode={mode!r} "
-                f"(media_url={'present' if media_url else 'missing'}, "
-                f"title={'present' if title else 'missing'})"
-            )
+            if mode != "image":
+                log_info(
+                    f"[similarity] product_id={pid} reference mode={mode!r} "
+                    f"(media_url={'present' if media_url else 'missing'}, "
+                    f"title={'present' if title else 'missing'})"
+                )
 
-        review_urls = list(url_opencv.keys())
+            review_urls = list(url_opencv.keys())
 
-        if ref_emb is not None:
-            clip_scores = compute_clip_scores(pid, review_urls, ref_emb)
-            # Text-reference scores are less reliable — scale down before blending.
-            if mode == "text":
-                clip_scores = {url: s * _TEXT_CLIP_SCALE for url, s in clip_scores.items()}
-        else:
-            clip_scores = {}
-
-        # Step 5–6 — blend and store
-        similarity_map.add_product(pid)
-        for url in sorted(review_urls):
-            opencv_score = url_opencv[url]
-            clip_score = clip_scores.get(url)
-            if clip_score is not None:
-                blended = CLIP_WEIGHT_IN_BLEND * clip_score + OPENCV_WEIGHT_IN_BLEND * opencv_score
+            if mode == "image" and ref_emb is not None:
+                # Image-to-image reference: additive boost formula (most accurate)
+                clip_scores = compute_clip_scores(pid, review_urls, ref_emb)
+            elif mode == "text" and title:
+                # Text-only reference: multiplicative formula so human boost requires
+                # product relevance — prevents any human photo from ranking high
+                clip_scores = compute_clip_scores_text_ref(pid, review_urls, title)
             else:
-                # CLIP unavailable — fall back to opencv quality only
-                blended = opencv_score
-            similarity_map.add_image(pid, url, score=blended)
+                clip_scores = {}
+
+            # Step 5–6 — blend and store
+            similarity_map.add_product(pid)
+            for url in sorted(review_urls):
+                opencv_score = url_opencv[url]
+                clip_score = clip_scores.get(url)
+                if clip_score is not None:
+                    blended = CLIP_WEIGHT_IN_BLEND * clip_score + OPENCV_WEIGHT_IN_BLEND * opencv_score
+                else:
+                    # CLIP unavailable — fall back to opencv quality only
+                    blended = opencv_score
+                similarity_map.add_image(pid, url, score=min(0.99, max(0.0, blended)))
+
+        except Exception as exc:
+            log_info(
+                f"[similarity] product_id={pid} scoring failed: {exc} — skipping product.\n"
+                f"Traceback:\n{traceback.format_exc()}"
+            )
 
     return similarity_map
 

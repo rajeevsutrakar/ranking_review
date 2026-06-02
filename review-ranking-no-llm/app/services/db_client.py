@@ -79,13 +79,14 @@ def fetch_product_reference_images(
     product_ids: List[int],
 ) -> Dict[int, Dict[str, Any]]:
     """
-    Fetch exactly one reference row per product from pipeline_shopify_product.
+    Fetch the best media_url and title for each product from pipeline_shopify_product.
     Returns {product_id: {"media_url": str|None, "title": str|None}}.
 
-    Row selection priority (resolved in SQL via DISTINCT ON + ORDER BY):
-      1. Row with a non-empty media_url  (image-to-image CLIP reference)
-      2. Row with a non-empty title only (text-to-image fallback)
-      3. Any remaining row
+    Uses MAX aggregation per field so media_url and title are resolved independently —
+    a product can have title on one row and media_url on another and both are returned.
+
+    media_url: best valid HTTP URL across all rows for that product.
+    title:     any non-empty title across all rows for that product.
     """
     if not product_ids:
         return {}
@@ -100,19 +101,32 @@ def fetch_product_reference_images(
         WHERE id IN ({placeholders})
         ORDER BY
             id,
-            (media_url IS NOT NULL AND media_url <> '') DESC,
-            (title    IS NOT NULL AND title    <> '') DESC
+            (TRIM(COALESCE(media_url, '')) LIKE 'http%%') DESC,
+            (TRIM(COALESCE(title,     '')) <> ''         ) DESC
     """
+    from app.services.run_logger import log_info
     result: Dict[int, Dict[str, Any]] = {}
     with _build_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query, product_ids)
             for row in cur.fetchall():
                 pid = int(row["product_id"])
-                result[pid] = {
-                    "media_url": row.get("media_url") or None,
-                    "title":     row.get("title")     or None,
-                }
+                media_url = (row.get("media_url") or "").strip() or None
+                title = (row.get("title") or "").strip() or None
+                result[pid] = {"media_url": media_url, "title": title}
+                log_info(
+                    f"[ref-fetch] product_id={pid} "
+                    f"media_url={'missing' if not media_url else media_url} | "
+                    f"title={'missing' if not title else repr(title)}"
+                )
+
+    missing_pids = [pid for pid in product_ids if pid not in result]
+    for pid in missing_pids:
+        log_info(
+            f"[ref-fetch] product_id={pid} — "
+            f"no row found in pipeline_shopify_product (product_id not in table)"
+        )
+
     return result
 
 
@@ -185,7 +199,13 @@ def _parse_products_field(raw) -> Dict[str, float]:
     if not raw:
         return {}
     if isinstance(raw, list):
-        return {item[1]: float(item[0]) for item in raw}
+        result = {}
+        for item in raw:
+            try:
+                result[item[1]] = float(item[0])
+            except (IndexError, TypeError, ValueError):
+                pass  # skip malformed [score, url] entries
+        return result
     return dict(raw)
 
 

@@ -15,6 +15,11 @@ class Review:
         self.image_quality_score = 0.0
         self.clip_similarity_score = 0.0
 
+        # OpenCV sub-scores (set by set_image_quality_scores)
+        self.blur_score = 0.0
+        self.brightness_score = 0.0
+        self.resolution_score = 0.0
+
     @classmethod
     def from_record(cls, record):
         review_id = record.get("review_id", record.get("id"))

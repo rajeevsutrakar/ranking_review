@@ -87,8 +87,10 @@ def _get_clip():
 # ── image fetch + embed ───────────────────────────────────────────────────────
 
 def _fetch_pil(url: str) -> PILImage.Image | None:
+    from PIL import Image, UnidentifiedImageError
+    from app.services.run_logger import log_warn
+    fname = url.rsplit("/", 1)[-1].split("?")[0]
     try:
-        from PIL import Image
         r = requests.get(
             url,
             timeout=_REQUEST_TIMEOUT_S,
@@ -96,8 +98,18 @@ def _fetch_pil(url: str) -> PILImage.Image | None:
         )
         r.raise_for_status()
         return Image.open(io.BytesIO(r.content)).convert("RGB")
-    except Exception:
-        return None
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        log_warn(f"[clip] HTTP {status} fetching image: {fname}  url={url}")
+    except requests.exceptions.Timeout:
+        log_warn(f"[clip] Timeout fetching image: {fname}  url={url}")
+    except requests.exceptions.ConnectionError:
+        log_warn(f"[clip] Connection error fetching image: {fname}  url={url}")
+    except UnidentifiedImageError:
+        log_warn(f"[clip] PIL cannot identify image format: {fname}  url={url}")
+    except Exception as exc:
+        log_warn(f"[clip] Unexpected fetch/decode error ({type(exc).__name__}): {fname}  url={url}")
+    return None
 
 
 def _l2_normalize(v: np.ndarray) -> np.ndarray:
@@ -160,7 +172,11 @@ def build_reference_embedding(
     Build the reference embedding for one product.
     Returns (embedding, mode) where mode = "image" | "text" | "none".
     """
-    if media_url:
+    if media_url and not media_url.startswith(("http://", "https://")):
+        from app.services.run_logger import log_warn
+        log_warn(f"[clip] Invalid media_url (not an HTTP URL) — value={media_url!r}. Skipping image reference.")
+
+    if media_url and media_url.startswith(("http://", "https://")):
         emb = embed_image_from_url(media_url)
         if emb is not None:
             return emb, "image"
@@ -266,11 +282,67 @@ def compute_clip_scores(
             score = raw_clip + boost_factor * CLIP_HUMAN_WEIGHT * (1.0 - raw_clip)
         else:
             score = raw_clip
+        score = min(0.99, max(0.0, score))
 
         fname = url.rsplit("/", 1)[-1].split("?")[0]
         log_info(
             f"[clip] pid={product_id} tier={tier:10s} "
             f"raw={raw_clip:.3f} adjusted={score:.3f}  {fname}"
+        )
+        scores[url] = score
+
+    return scores
+
+
+def compute_clip_scores_text_ref(
+    product_id: int,
+    review_image_urls: list[str],
+    title: str,
+) -> dict[str, float]:
+    """
+    Score review images when no product reference image is available — only a title.
+
+    Problem with image-reference approach applied to text:
+      additive formula (raw + boost × HW × (1-raw)) inflates ANY human photo
+      regardless of product relevance, because the text embedding mixes
+      "person wearing" + "{title}" semantics together.
+
+    Solution — multiplicative formula with a product-only prompt:
+      1. product_sim = cosine(image_emb, embed_text("a photo of {title}"))
+         → pure product relevance, no person bias baked in
+      2. tier = classify_image_type(image_emb)
+         → independent human-detection signal
+      3. score = product_sim × (1.0 + boost × CLIP_HUMAN_WEIGHT)   [multiplicative]
+         → a generic person photo (low product_sim) stays low even with full boost
+         → a relevant worn image (higher product_sim) gets a meaningful lift
+
+    Scores are naturally lower than image-reference mode (text-to-image CLIP
+    cosine similarities are ~0.15–0.35), which correctly reflects lower confidence.
+    """
+    from app.config import CLIP_HUMAN_WEIGHT, PACKAGING_SCORE_PENALTY
+    from app.services.run_logger import log_info
+
+    product_emb = embed_text(f"a photo of {title}")
+
+    scores: dict[str, float] = {}
+    for url in review_image_urls:
+        emb = embed_image_from_url(url)
+        if emb is None:
+            continue
+
+        product_sim = cosine_similarity(emb, product_emb)
+        boost_factor, tier = classify_image_type(emb)
+
+        if tier == "packaging":
+            score = product_sim * PACKAGING_SCORE_PENALTY
+        else:
+            score = product_sim * (1.0 + boost_factor * CLIP_HUMAN_WEIGHT)
+        score = min(0.99, max(0.0, score))
+
+        fname = url.rsplit("/", 1)[-1].split("?")[0]
+        log_info(
+            f"[clip-text] pid={product_id} tier={tier:10s} "
+            f"prod_sim={product_sim:.3f} adjusted={score:.3f}  {fname}"
         )
         scores[url] = score
 

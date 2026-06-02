@@ -17,5 +17,9 @@ def log_info(message: str) -> None:
     _write("INFO", message)
 
 
+def log_warn(message: str) -> None:
+    _write("WARN", message)
+
+
 def log_error(message: str) -> None:
     _write("ERROR", message)

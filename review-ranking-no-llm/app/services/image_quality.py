@@ -11,6 +11,7 @@ import numpy as np
 import requests
 
 from app.config import IMAGE_QUALITY_MAX_IMAGES, IMAGE_QUALITY_REQUEST_TIMEOUT_S
+from app.services.run_logger import log_warn
 
 _cv2_module = None
 
@@ -59,9 +60,10 @@ def _decode_image_bytes(data: bytes) -> np.ndarray | None:
     return img
 
 
-def _score_single_bgr(img: np.ndarray) -> float:
+def _score_single_bgr(img: np.ndarray) -> tuple[float, float, float, float] | None:
+    """Return (total, blur_n, bright_n, res_n) or None if image is invalid."""
     if img is None or img.size == 0:
-        return 0.0
+        return None
     cv2 = _get_cv2()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
@@ -70,7 +72,8 @@ def _score_single_bgr(img: np.ndarray) -> float:
     blur_n = _normalize_blur(blur_var)
     bright_n = _normalize_brightness(gray)
     res_n = _normalize_resolution(h, w)
-    return float(0.42 * blur_n + 0.28 * bright_n + 0.30 * res_n)
+    total = float(0.42 * blur_n + 0.28 * bright_n + 0.30 * res_n)
+    return total, blur_n, bright_n, res_n
 
 
 def _extract_urls(images: Any) -> List[str]:
@@ -107,6 +110,7 @@ def first_image_url(images: Any) -> str | None:
 
 
 def _fetch_image_bytes(url: str) -> bytes | None:
+    fname = url.rsplit("/", 1)[-1].split("?")[0]
     try:
         r = requests.get(
             url,
@@ -115,16 +119,26 @@ def _fetch_image_bytes(url: str) -> bytes | None:
         )
         r.raise_for_status()
         return r.content
-    except Exception:
-        return None
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        log_warn(f"[opencv] HTTP {status} fetching image: {fname}  url={url}")
+    except requests.exceptions.Timeout:
+        log_warn(f"[opencv] Timeout fetching image: {fname}  url={url}")
+    except requests.exceptions.ConnectionError:
+        log_warn(f"[opencv] Connection error fetching image: {fname}  url={url}")
+    except Exception as exc:
+        log_warn(f"[opencv] Unexpected fetch error ({type(exc).__name__}): {fname}  url={url}")
+    return None
 
 
-def _score_one_url(url: str) -> float | None:
+def _score_one_url(url: str) -> tuple[float, float, float, float] | None:
     raw = _fetch_image_bytes(url)
     if not raw:
         return None
     img = _decode_image_bytes(raw)
     if img is None:
+        fname = url.rsplit("/", 1)[-1].split("?")[0]
+        log_warn(f"[opencv] Decode failed (unsupported format or corrupt data): {fname}  url={url}")
         return None
     return _score_single_bgr(img)
 
@@ -144,13 +158,51 @@ def compute_image_quality_score(images: Any, max_images: int | None = None) -> f
 
     scores: List[float] = []
     for url in urls:
-        s = _score_one_url(url)
-        if s is not None:
-            scores.append(float(s))
+        result = _score_one_url(url)
+        if result is not None:
+            scores.append(result[0])
 
     if not scores:
         return 0.0
     return float(sum(scores) / len(scores))
+
+
+def compute_image_quality_score_with_components(
+    images: Any, max_images: int | None = None
+) -> tuple[float, float, float, float]:
+    """
+    Returns (opencv_score, blur_score, brightness_score, resolution_score).
+    All values are means across successfully decoded images. Returns (0,0,0,0) if none.
+    """
+    cap = max_images if max_images is not None else IMAGE_QUALITY_MAX_IMAGES
+    cap = max(0, int(cap))
+
+    urls = _extract_urls(images)[:cap]
+    if not urls:
+        return 0.0, 0.0, 0.0, 0.0
+
+    totals: List[float] = []
+    blurs: List[float] = []
+    brights: List[float] = []
+    ress: List[float] = []
+    for url in urls:
+        result = _score_one_url(url)
+        if result is not None:
+            total, blur_n, bright_n, res_n = result
+            totals.append(total)
+            blurs.append(blur_n)
+            brights.append(bright_n)
+            ress.append(res_n)
+
+    if not totals:
+        return 0.0, 0.0, 0.0, 0.0
+    n = len(totals)
+    return (
+        float(sum(totals) / n),
+        float(sum(blurs) / n),
+        float(sum(brights) / n),
+        float(sum(ress) / n),
+    )
 
 
 def compute_image_quality_scores_per_url(images: Any, max_images: int | None = None) -> dict[str, float]:
@@ -168,9 +220,9 @@ def compute_image_quality_scores_per_url(images: Any, max_images: int | None = N
 
     url_scores: dict[str, float] = {}
     for url in urls:
-        s = _score_one_url(url)
-        if s is not None:
-            url_scores[url] = float(s)
+        result = _score_one_url(url)
+        if result is not None:
+            url_scores[url] = float(result[0])
 
     return url_scores
 
@@ -178,8 +230,11 @@ def compute_image_quality_scores_per_url(images: Any, max_images: int | None = N
 def set_image_quality_scores(reviews: Sequence[Any]) -> None:
     for review in reviews:
         images = getattr(review, "images", None) or []
-        score = compute_image_quality_score(images)
-        review.image_quality_score = score
+        opencv, blur, brightness, resolution = compute_image_quality_score_with_components(images)
+        review.image_quality_score = opencv
+        review.blur_score = blur
+        review.brightness_score = brightness
+        review.resolution_score = resolution
 
 
 def review_has_image_url(review: Any) -> bool:
