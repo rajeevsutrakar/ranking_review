@@ -5,15 +5,19 @@ All default values are defined in `app/config.py` and can be overridden via `.en
 ---
 
 ## 1. OpenCV Image Quality Score
-**File:** `app/services/image_quality.py` · line 73
+**File:** `app/services/image_quality.py`
 
-Formula: `opencv_score = 0.42 × blur + 0.28 × brightness + 0.30 × resolution`
+Formula: `opencv_score = blur_n`
 
-| Sub-score   | Weight | How it is computed                                                  |
-|-------------|--------|---------------------------------------------------------------------|
-| Blur        | 0.42   | Laplacian variance / 350, capped at 1.0. Values > 1200 → 0 (noise) |
-| Brightness  | 0.28   | 1.0 if mean brightness in [0.2–0.7], linear penalty outside range  |
-| Resolution  | 0.30   | pixels / (640×640), capped at 1.0                                  |
+| Sub-score   | In composite      | How it is computed                                                          |
+|-------------|-------------------|-----------------------------------------------------------------------------|
+| Blur        | Yes               | Centre 60% crop → Laplacian variance / 350, capped at 1.0. Values > 6000 → 0 |
+| Brightness  | No (per-dim only) | 1.0 if mean brightness in [0.2–0.7], linear penalty outside range            |
+| Resolution  | No (per-dim only) | pixels / (640×640), capped at 1.0                                            |
+
+Brightness and resolution are computed and returned for downstream use but
+excluded from the composite — both saturated at 1.0 for 98%+ of Shopify-CDN
+catalogue images and provide no discriminative signal.
 
 Output range: [0.0, 1.0]
 

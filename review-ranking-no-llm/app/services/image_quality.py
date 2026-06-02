@@ -26,10 +26,11 @@ def _get_cv2():
 
 
 def _normalize_blur(laplacian_var: float) -> float:
-    # Real photos (even very sharp ones): Laplacian variance 50–600.
-    # Pure noise / corrupted images: 3,000–50,000+.
-    # Values above 1200 are almost certainly noise, not genuine sharpness.
-    if laplacian_var > 1200.0:
+    # Real photos on smooth backgrounds: Laplacian variance 50–600.
+    # Real photos of printed/patterned subjects (textured fabric, busy
+    # backgrounds): legitimately 1200–6000 from genuine pattern detail.
+    # Sensor noise / corrupted images: 8000+.
+    if laplacian_var > 6000.0:
         return 0.0
     return float(min(1.0, max(0.0, laplacian_var / 350.0)))
 
@@ -66,13 +67,22 @@ def _score_single_bgr(img: np.ndarray) -> tuple[float, float, float, float] | No
         return None
     cv2 = _get_cv2()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
-    blur_var = float(lap.var())
     h, w = gray.shape[:2]
+    # Centre 60% crop for blur measurement only — keeps the metric focused on
+    # the product and away from background texture. Brightness and resolution
+    # still use the full frame.
+    yc, xc = h // 5, w // 5
+    blur_region = gray[yc:h - yc, xc:w - xc]
+    lap = cv2.Laplacian(blur_region, cv2.CV_64F)
+    blur_var = float(lap.var())
     blur_n = _normalize_blur(blur_var)
     bright_n = _normalize_brightness(gray)
     res_n = _normalize_resolution(h, w)
-    total = float(0.42 * blur_n + 0.28 * bright_n + 0.30 * res_n)
+    # Composite = blur only. Brightness and resolution are degenerate on
+    # Shopify-CDN catalogue images (98%+ saturate at 1.0) so they contribute
+    # no discriminative signal. They are still returned per-dimension so
+    # downstream consumers can use them independently.
+    total = float(blur_n)
     return total, blur_n, bright_n, res_n
 
 
